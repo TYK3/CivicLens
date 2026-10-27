@@ -1,0 +1,162 @@
+"""Rebuild the two browser pages in viewer/ from the templates in viewer/src/ and the current data.
+
+    python run.py viewers                     # needs: pandas, numpy; node optional (engine check)
+
+Inputs: data/processed/{oa.csv, facilities.csv, facilities_places.csv, lsoa.geojson, flood_zone3.geojson},
+        data/db/places.csv + source_records.csv + summary.json (falls back to data/db/sample/).
+Outputs: viewer/site_simulator.html, viewer/places_register.html (self-contained, open by double-click),
+         frontend/public/data/{places,city}.json for the React app.
+"""
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from pipeline.places import specialty_of  # noqa: E402
+from simulator.paths import DB as FULL_DB, DB_SAMPLE, FRONTEND, PROC, VIEWER  # noqa: E402
+
+SRC = VIEWER / "src"
+DB = FULL_DB if (FULL_DB / "places.csv").exists() else DB_SAMPLE
+
+
+def esc(s: str) -> str:
+    return s.replace("</", "<\\/")  # safe inside <script> tags
+
+
+def pack(fac_file: str) -> dict:
+    """City data (Output Areas, sites, LSOA shapes, flood shapes) via viewer/src/pack_city.py."""
+    out = Path(tempfile.mkdtemp()) / "data.json"
+    subprocess.run([sys.executable, str(SRC / "pack_city.py"), str(ROOT), str(out), fac_file], check=True)
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def places_slim(places: pd.DataFrame) -> dict:
+    p = places[places["lat"].notna()]
+    fl = p["flags"].fillna("")
+    return {"lat": p["lat"].round(6).tolist(), "lon": p["lon"].round(6).tolist(), "name": p["name"].fillna("").tolist(),
+            "cat": p["category"].tolist(), "grp": p["industry_group"].fillna("Other").tolist(),
+            "ro": fl.str.contains("REGISTERED_OFFICE_ONLY").astype(int).tolist(),
+            "cf": p["customer_facing"].astype(str).str.lower().eq("true").astype(int).tolist(),
+            "src": p["sources"].fillna("").tolist(), "conf": p["confidence"].astype(int).tolist(),
+            "id": p["place_id"].tolist(), "co": p["company_number"].fillna("").tolist()}
+
+
+def area_data() -> dict:
+    oa = pd.read_csv(PROC / "oa.csv")
+    return {"oa": {"lat": oa.lat.round(6).tolist(), "lon": oa.lon.round(6).tolist(), "pop": oa["pop"].round().astype(int).tolist(),
+                   "ward": oa.ward.tolist(), "q": oa.imd_quintile.astype(int).tolist()},
+            "lsoa_ward": oa.groupby("lsoa").ward.agg(lambda s: s.mode().iloc[0]).to_dict(),
+            "ward_pop": oa.groupby("ward")["pop"].sum().round().astype(int).to_dict()}
+
+
+def ward_outlines() -> dict:
+    """Each ward's outline as closed rings [[lon, lat], ...]: the LSOA edges used once within the ward, chained."""
+    oa = pd.read_csv(PROC / "oa.csv")
+    lsoa_ward = oa.groupby("lsoa").ward.agg(lambda s: s.mode().iloc[0]).to_dict()
+    gj = json.loads((PROC / "lsoa.geojson").read_text(encoding="utf-8"))
+    segs = {}
+    for f in gj["features"]:
+        ward = lsoa_ward.get(f["properties"]["LSOA21CD"])
+        if not ward:
+            continue
+        g = f["geometry"]
+        for poly in (g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]):
+            for ring in poly:
+                rr = [(round(x, 6), round(y, 6)) for x, y in ring]
+                for a, b in zip(rr[:-1], rr[1:]):
+                    if a != b:
+                        k = (ward, *sorted((a, b)))
+                        segs[k] = segs.get(k, 0) + 1
+    out = {}
+    for ward in sorted(set(lsoa_ward.values())):
+        nb = {}
+        for (w, a, b), n in segs.items():
+            if w == ward and n == 1:
+                nb.setdefault(a, []).append(b); nb.setdefault(b, []).append(a)
+        rings = []
+        while nb:
+            start = next(iter(nb)); ring = [start]; cur = start
+            while True:
+                nxt = nb[cur].pop()
+                nb[nxt].remove(cur)
+                for p in (cur, nxt):
+                    if not nb[p]:
+                        del nb[p]
+                if nxt == start or nxt not in nb:
+                    ring.append(nxt); break
+                ring.append(nxt); cur = nxt
+            if len(ring) > 3:
+                rings.append([[round(x, 5), round(y, 5)] for x, y in ring[::2] + [ring[-1]]])  # every 2nd vertex is plenty
+        out[ward] = rings
+    return out
+
+
+def frontend_data(places: pd.DataFrame, city: dict, sources: dict):
+    """Data files for the CivicLens React app (frontend/public/data/)."""
+    out = FRONTEND / "public" / "data"
+    out.mkdir(parents=True, exist_ok=True)
+    p = places[places["lat"].notna()].copy()
+    fl = p["flags"].fillna("")
+    bad = fl.str.contains("SOURCES_DISAGREE_ON_LOCATION|TYPE_CONFLICT|FAR_FROM_OWN_POSTCODE|POSTCODE_INVALID|NO_COORDINATES")
+    s = lambda c: p[c].fillna("").astype(str).tolist()
+    cols = {"id": s("place_id"), "name": s("name"), "lat": p["lat"].round(6).tolist(), "lon": p["lon"].round(6).tolist(),
+            "grp": p["industry_group"].fillna("Other").tolist(), "cat": s("category"), "spec": s("specialty"),
+            "from": s("specialty_from"), "ward": s("ward"), "pc": s("postcode"), "addr": s("address"), "src": s("sources"),
+            "conf": p["confidence"].astype(int).tolist(), "inside": p["inside_city"].astype(str).str.lower().eq("true").astype(int).tolist(),
+            "ro": fl.str.contains("REGISTERED_OFFICE_ONLY").astype(int).tolist(), "bad": bad.astype(int).tolist(),
+            "cf": p["customer_facing"].astype(str).str.lower().eq("true").astype(int).tolist(), "web": s("website"),
+            "gmap": s("google_maps_search")}
+    (out / "places.json").write_text(json.dumps(cols, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+    (out / "city.json").write_text(json.dumps({**city, "ward_outlines": ward_outlines(), "sources": sources},
+                                              separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+    print(f"Wrote front-end data to {out}")
+
+
+def main():
+    places = pd.read_csv(DB / "places.csv", dtype={"company_number": str})
+    places_csv = (DB / "places.csv").read_text(encoding="utf-8")
+    if "specialty" not in places:  # builds made before the advanced search: add the labels the same way
+        sp = places.apply(specialty_of, axis=1)
+        places["specialty"], places["specialty_from"] = sp.str[0], sp.str[1]
+        places_csv = places.to_csv(index=False)
+    summary = json.loads((DB / "summary.json").read_text(encoding="utf-8"))
+    sources = summary.pop("sources", {})
+    city_places = pack("facilities_places.csv")
+    city_base = pack("facilities.csv")
+    engine = (SRC / "engine.js").read_text(encoding="utf-8")
+
+    sim = ((SRC / "site_simulator.template.html").read_text(encoding="utf-8")
+           .replace("__DATA__", esc(json.dumps(city_places, separators=(",", ":"))))
+           .replace("__BASEFAC__", esc(json.dumps(city_base["fac"], separators=(",", ":"))))
+           .replace("__PLACES__", esc(json.dumps(places_slim(places), separators=(",", ":"))))
+           .replace("__PSOURCES__", esc(json.dumps(sources)))
+           .replace("__ENGINE__", engine))
+    (VIEWER / "site_simulator.html").write_text(sim, encoding="utf-8", newline="")
+
+    geo = {"lsoa": city_places["lsoa"], "edges": city_places["edges"]}
+    reg = ((SRC / "places_register.template.html").read_text(encoding="utf-8")
+           .replace("__PLACES__", esc(places_csv))
+           .replace("__RECS__", esc((DB / "source_records.csv").read_text(encoding="utf-8")))
+           .replace("__GEO__", esc(json.dumps(geo, separators=(",", ":"))))
+           .replace("__SUMMARY__", esc(json.dumps(summary)))
+           .replace("__AREA__", esc(json.dumps(area_data(), separators=(",", ":")))))
+    (VIEWER / "places_register.html").write_text(reg, encoding="utf-8", newline="")
+    print(f"Built viewer/site_simulator.html ({len(sim):,} bytes) and viewer/places_register.html ({len(reg):,} bytes) from {DB}")
+    frontend_data(places, city_places, sources)
+
+    if shutil.which("node"):  # JS engine must still match the Python engine's saved results
+        tmp = Path(tempfile.mkdtemp())
+        for f in ("engine.js", "verify_engine.js"):
+            shutil.copy(SRC / f, tmp / f)
+        (tmp / "data.json").write_text(json.dumps(city_base), encoding="utf-8")
+        subprocess.run(["node", str(tmp / "verify_engine.js"), str(ROOT)], check=False)
+
+
+if __name__ == "__main__":
+    main()
